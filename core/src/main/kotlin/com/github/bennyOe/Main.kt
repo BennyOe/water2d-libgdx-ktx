@@ -16,12 +16,13 @@ import com.github.bennyOe.water.Water
 class Main : ApplicationAdapter() {
 
     companion object {
-        // Pixels-per-meter scale used across camera & input conversions
-        private const val PPM = 100f
+        val GRAVITY = Vector2(0f, -10f)
         private const val TIME_STEP = 1f / 60f
         private const val VEL_ITERS = 6
         private const val POS_ITERS = 2
-        private val GRAVITY = Vector2(0f, -10f)
+
+        // Pixels-per-meter scale used across camera & input conversions
+        private const val PPM = 100f
     }
 
     private lateinit var stage: Stage

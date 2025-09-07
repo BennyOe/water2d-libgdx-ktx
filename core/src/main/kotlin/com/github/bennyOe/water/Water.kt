@@ -21,10 +21,12 @@ import com.badlogic.gdx.physics.box2d.FixtureDef
 import com.badlogic.gdx.physics.box2d.PolygonShape
 import com.badlogic.gdx.physics.box2d.World
 import com.badlogic.gdx.utils.Disposable
+import com.github.bennyOe.Main.Companion.GRAVITY
 import com.github.bennyOe.water.IntersectionUtils.getRandomVector
 import java.util.LinkedHashSet
 
 import kotlin.math.abs
+import kotlin.math.absoluteValue
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.random.Random
@@ -62,7 +64,7 @@ class Water(
     var spread: Float = 0.25f
     var density: Float = 1f
 
-    val columnSeparation: Float = 0.04f // 4 px between every column
+    val columnSeparation: Float = 0.02f // 4 px between every column
 
     /**
      * Constructor that allows to specify if there is an effect of waves and splash particles.
@@ -109,41 +111,46 @@ class Water(
      * Creates the body of the water. It will be a square sensor in a specific Box2d world.
      *
      * @param world  Our box2d world
-     * @param x      Position of the x coordinate of the center of the body
-     * @param y      Position of the y coordinate of the center of the body
+     * @param centerX      Position of the x coordinate of the center of the body
+     * @param centerY      Position of the y coordinate of the center of the body
      * @param width  Body width
      * @param height Body height
      */
-    fun createBody(world: World, x: Float, y: Float, width: Float, height: Float) {
-        val bodyDef = BodyDef()
-        bodyDef.type = BodyType.StaticBody
-        bodyDef.position.set(x, y)
+    fun createBody(world: World, centerX: Float, centerY: Float, width: Float, height: Float) {
+        // Guard: dimensions must be positive
+        require(width > 0f && height > 0f) { "Water area must be positive." }
 
-        // Create our body in the world using our body definition
-        body = world.createBody(bodyDef)
-        body!!.userData = this
+        // Create static body at (centerX, centerY)
+        val b = world.createBody(BodyDef().apply {
+            type = BodyType.StaticBody
+            position.set(centerX, centerY)
+        }).also { it.userData = this }
 
-        val square = PolygonShape()
-        square.setAsBox(width / 2, height / 2)
+        body = b
 
-        // Create a fixture definition to apply our shape to
-        val fixtureDef = FixtureDef()
-        fixtureDef.shape = square
+        // Create a rectangular sensor fixture that covers the water area
+        PolygonShape().also { shape ->
+            shape.setAsBox(width / 2f, height / 2f)
+            b.createFixture(FixtureDef().apply {
+                this.shape = shape
+                isSensor = true
+            })
+            // Important: dispose Box2D shape after the fixture has been created
+            shape.dispose()
+        }
 
-        // Must be a sensor
-        fixtureDef.isSensor = true
-
-        // Create our fixture and attach it to the body
-        body!!.createFixture(fixtureDef)
-
-        square.dispose()
-
-        // Water columns (waves)
+        // Initialize wave columns (including both edges)
         if (waves) {
-            val count = (width / columnSeparation).toInt()
-            for (i in 0..count) {
-                val cx = i * columnSeparation + x - width / 2
-                columns.add(WaterColumn(cx, y - height / 2, y + height / 2, y + height / 2, 0f))
+            val startX = centerX - width / 2f
+            val bottomY = centerY - height / 2f
+            val topY = centerY + height / 2f
+
+            // Number of segments across the width (ensure at least 1)
+            val segments = max(1, (width / columnSeparation).toInt())
+
+            repeat(segments + 1) { i ->
+                val cx = startX + i * columnSeparation
+                columns.add(WaterColumn(cx, bottomY, topY, topY, 0f))
             }
         }
     }
@@ -153,103 +160,94 @@ class Water(
      * gravity by calculating the area in contact, centroid and force required.
      */
     fun update() {
-        if (body != null) {
-            val world = body!!.world
-            for (pair in fixturePairs) {
-                val fixtureA: Fixture = pair.first
-                val fixtureB: Fixture = pair.second
+        // Guard: if there is no water body, nothing to update
+        val waterBody = body ?: return
+        val world = waterBody.world
 
-                val clippedPolygon: MutableList<Vector2> = ArrayList()
-                if (IntersectionUtils.findIntersectionOfFixtures(fixtureA, fixtureB, clippedPolygon)) {
-                    // find centroid and area
+        // Iterate over all current contact pairs between water (fixtureA) and an object (fixtureB)
+        for ((fluidFix, objectFix) in fixturePairs) {
+            val clipped: MutableList<Vector2> = ArrayList()
 
-                    val interPolygon = IntersectionUtils.getIntersectionPolygon(clippedPolygon)
-                    val centroid = Vector2()
-                    GeometryUtils.polygonCentroid(interPolygon.vertices, 0, interPolygon.vertices.size, centroid)
-                    val area = interPolygon.area()
+            // Compute intersection polygon (object ∩ fluid); skip if there is no overlap
+            if (!IntersectionUtils.findIntersectionOfFixtures(fluidFix, objectFix, clipped)) continue
 
-                    /* Get fixtures bodies */
-                    val fluidBody = fixtureA.body
-                    val fixtureBody = fixtureB.body
+            // --- Buoyancy (Archimedes) ------------------------------------------------------------
+            // Build a Polygon from the clipped points to obtain area and centroid
+            val intersectionPoly = IntersectionUtils.getIntersectionPolygon(clipped)
 
-                    // apply buoyancy force (fixtureA is the fluid)
-                    val displacedMass = this.density * area
-                    val buoyancyForce = Vector2(
-                        displacedMass * -world.getGravity().x,
-                        displacedMass * -world.getGravity().y
-                    )
-                    fixtureB.body.applyForce(buoyancyForce, centroid, true)
+            val centroid = Vector2()
+            GeometryUtils.polygonCentroid(
+                intersectionPoly.vertices,           // float[] of x,y, x,y, ...
+                0,
+                intersectionPoly.vertices.size,
+                centroid
+            )
+            val area = intersectionPoly.area()
+            val displacedMass = density * area
 
+            // Buoyancy force opposes gravity (applied to the object's body at the centroid)
+            val objectBody = objectFix.body
+            val fluidBody = fluidFix.body
 
-                    /* Apply drag and lift forces */
-                    val polygonVertices = clippedPolygon.size
-                    for (i in 0..<polygonVertices) {
-                        /* End points and mid-point of the edge */
+            val gravity = world.gravity                                 // Vector2(gx, gy)
+            val buoyancyForce = Vector2(-gravity.x, -gravity.y).scl(displacedMass)
+            objectBody.applyForce(buoyancyForce, centroid, true)
 
-                        val firstPoint = clippedPolygon[i]
-                        val secondPoint = clippedPolygon[(i + 1) % polygonVertices]
-                        val midPoint = firstPoint.cpy().add(secondPoint).scl(0.5f)
+            // --- Hydrodynamics: drag & lift along each polygon edge -------------------------------
+            // We need the closed ring of edges, so we iterate indices and wrap the last-to-first edge.
+            val n = clipped.size
+            for (i in 0 until n) {
+                // Edge endpoints and mid point
+                val p1 = clipped[i]
+                val p2 = clipped[(i + 1) % n]
+                val mid = p1.cpy().add(p2).scl(0.5f)
 
-                        /*
-                         * Find relative velocity between the object and the fluid at edge
-                         * mid-point.
-                         */
-                        val velocityDirection = Vector2(
-                            fixtureBody
-                                .getLinearVelocityFromWorldPoint(midPoint)
-                                .sub(fluidBody.getLinearVelocityFromWorldPoint(midPoint))
-                        )
-                        val velocity = velocityDirection.len()
-                        velocityDirection.nor()
+                // Relative velocity at the mid point (object vs. fluid)
+                val relVel = objectBody.getLinearVelocityFromWorldPoint(mid)
+                    .sub(fluidBody.getLinearVelocityFromWorldPoint(mid))
+                val speed = relVel.len()
+                // If speed is ~0, no hydrodynamic forces to apply
+                if (speed == 0f) continue
+                val vHat = relVel.nor()  // unit velocity direction
 
-                        val edge = secondPoint.cpy().sub(firstPoint)
-                        val edgeLength = edge.len()
-                        edge.nor()
+                // Edge direction and its outward normal (right-handed)
+                val edge = p2.cpy().sub(p1)
+                val edgeLen = edge.len()
+                if (edgeLen == 0f) continue
+                val eHat = edge.nor()
+                val nHat = Vector2(eHat.y, -eHat.x) // rotate -90°
 
-                        val normal = Vector2(edge.y, -edge.x)
-                        val dragDot = normal.dot(velocityDirection)
+                // Drag acts opposite to motion and only on leading edges (normal · v ≥ 0)
+                val dragDot = nHat.dot(vHat)
+                if (dragDot < 0f) continue
 
-                        if (dragDot >= 0) {
+                // Common product used by both drag and lift
+                val common = edgeLen * density * speed * speed
 
-                            /*
-                             * Normal don't point backwards. This is a leading edge. Store
-                             * the result of multiply edgeLength, density and velocity
-                             * squared
-                             */
+                // Drag magnitude (clamped)
+                val dragMag = min(dragDot * DRAG_MOD * common, MAX_DRAG)
+                val dragForce = vHat.cpy().scl(-dragMag)
+                objectBody.applyForce(dragForce, mid, true)
 
-                            val tempProduct = edgeLength * density * velocity * velocity
+                // Lift magnitude (clamped): proportional to alignment of velocity with edge
+                val liftDot = eHat.dot(vHat)
+                val liftMag = min(dragDot * liftDot * LIFT_MOD * common, MAX_LIFT)
+                val liftDir = Vector2(-vHat.y, vHat.x)  // v rotated +90°
+                val liftForce = liftDir.scl(liftMag)
+                objectBody.applyForce(liftForce, mid, true)
 
-                            var drag = dragDot * DRAG_MOD * tempProduct
-                            drag = min(drag, MAX_DRAG)
-                            val dragForce = velocityDirection.cpy().scl(-drag)
-                            fixtureBody.applyForce(dragForce, midPoint, true)
+                // Gentle angular damping to reduce spinning when interacting with fluid
+                objectBody.applyTorque(-objectBody.angularVelocity / TORQUE_DAMPING, true)
+            }
 
-                            /* Apply lift force */
-                            val liftDot = edge.dot(velocityDirection)
-                            var lift = dragDot * liftDot * LIFT_MOD * tempProduct
-                            lift = min(lift, MAX_LIFT)
-                            val liftDirection = Vector2(
-                                -velocityDirection.y,
-                                velocityDirection.x
-                            )
-                            val liftForce = liftDirection.scl(lift)
-                            fixtureBody.applyForce(liftForce, midPoint, true)
-
-
-                            fixtureBody.applyTorque(-fixtureBody.angularVelocity / TORQUE_DAMPING, true)
-                        }
-                    }
-
-                    if (waves && area > MIN_SPLASH_AREA) {
-                        if (clippedPolygon.isNotEmpty()) {
-                            updateColumns(fixtureB.body, clippedPolygon)
-                        }
-                    }
-                }
+            // --- Wave coupling & splashes ---------------------------------------------------------
+            if (waves && area > MIN_SPLASH_AREA && clipped.isNotEmpty()) {
+                updateColumns(objectBody, clipped)
             }
         }
 
-        if (waves && splashParticles && !particles.isEmpty()) {
+        // --- Particle update ----------------------------------------------------------------------
+        if (waves && splashParticles && particles.isNotEmpty()) {
             updateParticles()
         }
     }
@@ -265,7 +263,7 @@ class Water(
             val elapsedTime = particle.time + Gdx.graphics.deltaTime
 
             val y = (baseY + (abs(particle.velocity.y) * elapsedTime)
-                + 0.5f * -10f * elapsedTime * elapsedTime)
+                    + 0.5f * GRAVITY.y * elapsedTime * elapsedTime)
 
             if (y < baseY) {
                 it.remove()
@@ -287,17 +285,13 @@ class Water(
         val minX = intersectionPoints.minOf { it.x }
         val maxX = intersectionPoints.maxOf { it.x }
 
-        for (i in columns.indices) {
-            val column = columns[i]
-
+        columns.forEach { column ->
             if (column.x in minX..maxX) {
                 // column points
                 val col1 = Vector2(column.x, column.height)
                 val col2 = Vector2(column.x, column.y)
 
-                for (j in 0 until intersectionPoints.size - 1) {
-                    val p1 = intersectionPoints[j]
-                    val p2 = intersectionPoints[j + 1]
+                intersectionPoints.zipWithNext().forEach { (p1, p2) ->
                     val intersection = IntersectionUtils.intersection(col1, col2, p1, p2)
                     if (intersection != null && intersection.y < column.height) {
                         if (body.linearVelocity.y < 0 && column.actualBody == null) {
@@ -321,29 +315,24 @@ class Water(
      * Update the position of each column with respect to the speed that has been applied
      */
     private fun updateWaves() {
-        for (i in columns.indices) {
-            columns[i].update(dampening, tension)
-        }
+        columns.forEach { it.update(dampening, tension) }
 
         val lDeltas = FloatArray(columns.size)
         val rDeltas = FloatArray(columns.size)
+        val s = spread
 
-        // do some passes where columns pull on their neighbours
         repeat(8) {
-            for (i in columns.indices) {
-                if (i > 0) {
-                    lDeltas[i] = this.spread * (columns[i].height - columns[i - 1].height)
-                    columns[i - 1].speed += lDeltas[i]
-                }
-                if (i < columns.size - 1) {
-                    rDeltas[i] = this.spread * (columns[i].height - columns[i + 1].height)
-                    columns[i + 1].speed += rDeltas[i]
-                }
+            columns.zipWithNext().forEachIndexed { idx, (left, right) ->
+                val d = s * (right.height - left.height)
+                lDeltas[idx + 1] = d
+                rDeltas[idx] = -d
+                left.speed += d
+                right.speed -= d
             }
 
-            for (i in columns.indices) {
-                if (i > 0) columns[i - 1].height += lDeltas[i]
-                if (i < columns.size - 1) columns[i + 1].height += rDeltas[i]
+            columns.zipWithNext().forEachIndexed { idx, (left, right) ->
+                left.height += lDeltas[idx + 1]
+                right.height += rDeltas[idx]
             }
         }
     }
@@ -365,28 +354,43 @@ class Water(
      * @param column We use it to know the speed of the body that is touching it
      */
     private fun createSplashParticles(column: WaterColumn) {
+        // Get the body that touched this column; if none, no particles are created
+        val body = column.actualBody ?: return
+
         val y = column.height
-        val bodyVel = abs(column.actualBody!!.getLinearVelocity().y)
+        val bodyVel = body.linearVelocity.y.absoluteValue
 
-        if (abs(bodyVel) > 3f) {
-            var i = 0
-            while (i < bodyVel / 8) {
-                val pos = Vector2(column.x, y).add(getRandomVector(column.targetHeight))
-                val vel: Vector2 = if (rand.nextInt(4) == 0) Vector2(0f, bodyVel / 2 + rand.nextFloat() * bodyVel / 2)
-                else if (pos.x < column.actualBody!!.getPosition().x) Vector2(
-                    -bodyVel / 5 + rand.nextFloat() * bodyVel / 5,
-                    bodyVel / 3 + rand.nextFloat() * bodyVel / 3
-                )
-                else Vector2(
-                    bodyVel / 5 + rand.nextFloat() * bodyVel / 5,
-                    bodyVel / 3 + rand.nextFloat() * bodyVel / 3
-                )
+        // Ignore very slow movements (no splash effect)
+        if (bodyVel <= 3f) return
 
-                val radius = rand.nextFloat() * (0.05f - 0.025f) + 0.025f
+        // Number of particles depends on velocity (at least 1)
+        val count = (bodyVel / 8f).toInt().coerceAtLeast(1)
 
-                this.createParticle(pos, vel, radius)
-                i++
+        repeat(count) {
+            // Particle start position near the water column, offset with some randomness
+            val pos = Vector2(column.x, y).add(getRandomVector(column.targetHeight))
+
+            // Particle velocity:
+            // 25% chance: straight up (splash shooting upwards)
+            // Otherwise: tilted left or right depending on which side of the body the particle spawns
+            val vel = when {
+                rand.nextInt(4) == 0 -> {
+                    val vy = bodyVel * (0.5f + rand.nextFloat() * 0.5f)   // 50%..100% of bodyVel
+                    Vector2(0f, vy)
+                }
+                else -> {
+                    val dir = if (pos.x < body.position.x) -1f else 1f    // Left or right direction
+                    val vx = dir * (bodyVel * (0.2f + rand.nextFloat() * 0.2f)) // 20%..40% of bodyVel
+                    val vy = bodyVel * (0.3333f + rand.nextFloat() * 0.3333f)   // 33%..66% of bodyVel
+                    Vector2(vx, vy)
+                }
             }
+
+            // Particle radius between 0.025 and 0.05
+            val radius = 0.025f + rand.nextFloat() * (0.05f - 0.025f)
+
+            // Add the new splash particle
+            createParticle(pos, vel, radius)
         }
     }
 
@@ -396,58 +400,78 @@ class Water(
      * @param camera Camera used in the current stage
      */
     fun draw(camera: Camera) {
-        // Ensure render resources are initialized during the render phase (after Application is ready)
+        // Make sure GPU-dependent resources exist (safe to call multiple times)
         ensureGraphicsInitialized()
-        if (hasWaves()) {
-            updateWaves()
 
-            polyBatch!!.setProjectionMatrix(camera.combined)
-            shapeBatch!!.setProjectionMatrix(camera.combined)
+        // Early-out if waves are disabled
+        if (!hasWaves()) return
 
-            // draw columns water
-            polyBatch!!.begin()
-            columns.zipWithNext().forEach { (c1, c2) ->
-                if (!this.isDebugMode) {
-                    val vertices = floatArrayOf(
-                        c1.x, c1.y, c1.x, c1.height, c2.x, c2.height, c2.x,
-                        c2.y
-                    )
-                    val sprite = PolygonSprite(
-                        PolygonRegion(
-                            textureWater, vertices,
-                            EarClippingTriangulator().computeTriangles(vertices).toArray()
-                        )
-                    )
-                    sprite.draw(
-                        polyBatch,
-                        min(1f, max(0.95f, c1.height / c1.targetHeight))
-                    ) // remove transparency for waves here if you don't want it
-                } else {
-                    shapeBatch!!.begin(ShapeType.Line)
-                    shapeBatch!!.line(Vector2(c1.x, c1.y), Vector2(c1.x, c1.height))
-                    shapeBatch!!.end()
-                }
+        // Run the wave simulation step before rendering
+        updateWaves()
+
+        // Cache local references to avoid repetitive !! and property lookups
+        val poly = polyBatch ?: return            // required for water polygons
+        val shape = shapeBatch ?: return          // used for debug lines (and rectangles)
+        val region = textureWater                 // can be null in debug mode
+        val debug = isDebugMode
+
+        // Set projection matrices for this camera
+        poly.projectionMatrix = camera.combined
+        shape.projectionMatrix = camera.combined
+
+        // --- Draw water surface as quads triangulated into polygons ---
+        poly.begin()
+        columns.zipWithNext().forEach { (c1, c2) ->
+            if (!debug) {
+                // Build a vertical quad between two neighboring columns:
+                // bottom-left (c1.x, c1.y), top-left (c1.x, c1.height),
+                // top-right (c2.x, c2.height), bottom-right (c2.x, c2.y)
+                val vertices = floatArrayOf(
+                    c1.x, c1.y,
+                    c1.x, c1.height,
+                    c2.x, c2.height,
+                    c2.x, c2.y
+                )
+
+                // Guard: texture region must exist when not in debug mode
+                val tex = region ?: return@forEach
+
+                // Triangulate the quad and draw it as a PolygonSprite
+                val triangles = EarClippingTriangulator().computeTriangles(vertices).toArray()
+                val sprite = PolygonSprite(PolygonRegion(tex, vertices, triangles))
+
+                // Slight transparency modulation based on column height (0.95..1.0)
+                val alpha = min(1f, max(0.95f, c1.height / c1.targetHeight))
+
+                sprite.draw(poly, alpha)
+            } else {
+                // Debug mode: just draw the left column as a vertical line
+                shape.begin(ShapeType.Line)
+                shape.line(Vector2(c1.x, c1.y), Vector2(c1.x, c1.height))
+                shape.end()
             }
-            polyBatch!!.end()
+        }
+        poly.end()
 
-            // draw splash particles
-            if (hasSplashParticles()) {
-                if (!this.isDebugMode) {
-                    spriteBatch!!.setProjectionMatrix(camera.combined)
-                    spriteBatch!!.begin()
-                    for (p in particles) {
-                        spriteBatch!!.draw(textureDrop, p.position.x, p.position.y, p.radius * 2, p.radius * 2)
-                    }
-                    spriteBatch!!.end()
-                } else {
-                    shapeBatch!!.setProjectionMatrix(camera.combined)
-                    shapeBatch!!.begin(ShapeType.Line)
-                    for (p in particles) {
-                        shapeBatch!!.rect(p.position.x, p.position.y, p.radius * 2, p.radius * 2)
-                    }
-                    shapeBatch!!.end()
-                }
+        // --- Draw splash particles (if enabled) ---
+        if (!hasSplashParticles()) return
+
+        if (!debug) {
+            val sb = spriteBatch ?: return
+            sb.projectionMatrix = camera.combined
+            sb.begin()
+            for (p in particles) {
+                // Draw each particle as a textured quad (size = diameter)
+                sb.draw(textureDrop, p.position.x, p.position.y, p.radius * 2, p.radius * 2)
             }
+            sb.end()
+        } else {
+            // Debug: render particles as wireframe rectangles
+            shape.begin(ShapeType.Line)
+            for (p in particles) {
+                shape.rect(p.position.x, p.position.y, p.radius * 2, p.radius * 2)
+            }
+            shape.end()
         }
     }
 

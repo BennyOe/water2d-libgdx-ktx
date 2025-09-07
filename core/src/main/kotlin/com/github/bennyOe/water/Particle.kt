@@ -5,7 +5,7 @@ import com.badlogic.gdx.math.Vector2
 /**
  * Particle representing a drop of water formed when a body impacts against water
  */
-class Particle(
+data class Particle(
     var position: Vector2,
     val velocity: Vector2,
     val radius: Float,

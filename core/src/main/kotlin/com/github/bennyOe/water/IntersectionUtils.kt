@@ -50,59 +50,72 @@ object IntersectionUtils {
      * @param outputVertices It will be set with the points that form the result intersection polygon
      * @return True if the two fixtures intersect
      */
-    fun findIntersectionOfFixtures(fA: Fixture, fB: Fixture, outputVertices: MutableList<Vector2>): Boolean {
-        // Supports polygon or circle fixtures.
-        if (fA.shape.type != Shape.Type.Polygon && fA.shape.type != Shape.Type.Circle ||
-            fB.shape.type != Shape.Type.Polygon && fB.shape.type != Shape.Type.Circle
-        ) return false
-
-        // if there is a circle, convert to octagon
-        val polyA: PolygonShape = if (fA.shape.type == Shape.Type.Circle) circleToSquare(fA)
-        else fA.shape as PolygonShape
-
-        val polyB: PolygonShape = if (fB.shape.type == Shape.Type.Circle) circleToSquare(fB)
-        else fB.shape as PolygonShape
-
-        // fill subject polygon from fixtureA polygon
-        for (i in 0 until polyA.vertexCount) {
-            val local = Vector2()
-            polyA.getVertex(i, local)
-            val world = fA.body.getWorldPoint(local)
-            outputVertices.add(Vector2(world))
+    fun findIntersectionOfFixtures(
+        fA: Fixture,
+        fB: Fixture,
+        outputVertices: MutableList<Vector2>
+    ): Boolean {
+        // Support only Polygon or Circle fixtures. Early-out otherwise.
+        val polyA: PolygonShape = when (fA.shape.type) {
+            Shape.Type.Polygon -> fA.shape as PolygonShape
+            Shape.Type.Circle  -> circleToSquare(fA)  // approximated by an axis-aligned square
+            else               -> return false
+        }
+        val polyB: PolygonShape = when (fB.shape.type) {
+            Shape.Type.Polygon -> fB.shape as PolygonShape
+            Shape.Type.Circle  -> circleToSquare(fB)
+            else               -> return false
         }
 
-        // fill clip polygon from fixtureB polygon
-        val clipPolygon: MutableList<Vector2> = ArrayList()
-        for (i in 0 until polyB.vertexCount) {
-            val local = Vector2()
-            polyB.getVertex(i, local)
-            val world = fB.body.getWorldPoint(local)
-            clipPolygon.add(Vector2(world))
+        // We "set" the output list (as documented), so clear it first.
+        outputVertices.clear()
+
+        // Build subject polygon from fixture A in world space
+        val tmp = Vector2()
+        repeat(polyA.vertexCount) { i ->
+            polyA.getVertex(i, tmp)                         // local coords into tmp
+            val world = fA.body.getWorldPoint(tmp)          // world coords (reuses tmp)
+            outputVertices.add(world.cpy())                 // store a copy; avoid aliasing
         }
 
+        // Build clip polygon from fixture B in world space
+        val clipPolygon = ArrayList<Vector2>(polyB.vertexCount)
+        repeat(polyB.vertexCount) { i ->
+            polyB.getVertex(i, tmp)
+            val world = fB.body.getWorldPoint(tmp)
+            clipPolygon.add(world.cpy())
+        }
+
+        // Sutherland–Hodgman clipping: clip subject by each edge of the clip polygon
         var cp1 = clipPolygon.last()
-        for (j in clipPolygon.indices) {
-            val cp2 = clipPolygon[j]
+        for (cp2 in clipPolygon) {
             if (outputVertices.isEmpty()) return false
-            val inputList: MutableList<Vector2> = ArrayList(outputVertices)
+
+            val input = ArrayList(outputVertices) // snapshot current subject
             outputVertices.clear()
-            var s = inputList[inputList.size - 1] // last on the input list
-            for (i in inputList.indices) {
-                val e = inputList[i]
-                if (inside(cp1, cp2, e)) {
-                    if (!inside(cp1, cp2, s)) {
-                        intersection(cp1, cp2, s, e)?.let { outputVertices.add(it) }
+
+            var s = input.last() // start from the last vertex (closing the loop)
+            for (e in input) {
+                val eInside = inside(cp1, cp2, e)
+                val sInside = inside(cp1, cp2, s)
+
+                if (eInside) {
+                    if (!sInside) {
+                        // Segment enters the clip half-space: add intersection first
+                        intersection(cp1, cp2, s, e)?.let(outputVertices::add)
                     }
+                    // Current point is inside: keep it
                     outputVertices.add(e)
-                } else if (inside(cp1, cp2, s)) {
-                    intersection(cp1, cp2, s, e)?.let { outputVertices.add(it) }
+                } else if (sInside) {
+                    // Segment exits the clip half-space: add intersection only
+                    intersection(cp1, cp2, s, e)?.let(outputVertices::add)
                 }
                 s = e
             }
             cp1 = cp2
         }
 
-        return !outputVertices.isEmpty()
+        return outputVertices.isNotEmpty()
     }
 
     /**
@@ -110,15 +123,16 @@ object IntersectionUtils {
      * @param vertices Vertices of the polygon
      * @return Polygon result
      */
-    fun getIntersectionPolygon(vertices: MutableList<Vector2>): Polygon {
+    fun getIntersectionPolygon(vertices: List<Vector2>): Polygon {
+        // Guard: no vertices → empty polygon
+        if (vertices.isEmpty()) return Polygon(floatArrayOf())
+
+        // Pack (x,y) pairs into a flat float array
         val points = FloatArray(vertices.size * 2)
-        var i = 0
-        var j = 0
-        while (i < vertices.size) {
-            points[j] = vertices[i].x
-            points[j + 1] = vertices[i].y
-            i++
-            j += 2
+        var k = 0
+        for (v in vertices) {
+            points[k++] = v.x
+            points[k++] = v.y
         }
 
         return Polygon(points)

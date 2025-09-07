@@ -27,7 +27,7 @@ class WaterColumn(
      * @param tension spring tension (>0)
      */
     fun update(dampening: Float, tension: Float) {
-        val delta = targetHeight - height       // was: local "x" (überschattete die Property x)
+        val delta = targetHeight - height
         speed += tension * delta - speed * dampening
         height += speed
     }
